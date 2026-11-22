@@ -45,6 +45,12 @@ class FlutterWindow : public Win32Window {
   WINDOWPLACEMENT placement_before_pip_{};
   LONG_PTR style_before_pip_ = 0;
   LONG_PTR ex_style_before_pip_ = 0;
+  // The screen rect and maximize state to come back to. Kept separately from
+  // placement_before_pip_ because that one is shaped for the registry
+  // (QueryWindowPlacement rewrites rcNormalPosition into the monitor's
+  // workspace inset, which LoadWindowPlacement reverses on the next launch).
+  RECT rect_before_pip_{};
+  bool was_maximized_before_pip_ = false;
 
   std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> pip_channel_;
 

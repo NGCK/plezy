@@ -1,3 +1,5 @@
+import 'dart:async' show unawaited;
+import 'dart:io' show Platform;
 import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
@@ -160,8 +162,44 @@ class VideoFilterManager {
     }
   }
 
+  /// How much to enlarge subtitles while the desktop PiP tile is on screen.
+  ///
+  /// libass sizes text relative to the window, so a tile a quarter of the
+  /// screen wide renders subtitles at roughly a quarter of their usual height.
+  /// Only the Windows tile needs this: Android and iOS hand PiP to the OS,
+  /// which scales the whole surface, and macOS keeps the main window.
+  static const double _pipSubtitleScale = 1.6;
+
+  /// The viewer's own `sub-scale` from before PiP, restored on the way out.
+  double? _prePipSubScale;
+
+  bool get _scalesSubtitlesForPip => Platform.isWindows;
+
+  Future<void> _enlargeSubtitlesForPip() async {
+    if (_prePipSubScale != null) return;
+    try {
+      final current = double.tryParse(await player.getProperty('sub-scale') ?? '') ?? 1.0;
+      _prePipSubScale = current;
+      await player.setProperty('sub-scale', (current * _pipSubtitleScale).toStringAsFixed(2));
+    } catch (e) {
+      appLogger.d('PiP: could not enlarge subtitles', error: e);
+    }
+  }
+
+  Future<void> _restoreSubtitlesAfterPip() async {
+    final previous = _prePipSubScale;
+    if (previous == null) return;
+    _prePipSubScale = null;
+    try {
+      await player.setProperty('sub-scale', previous.toStringAsFixed(2));
+    } catch (e) {
+      appLogger.d('PiP: could not restore subtitle size', error: e);
+    }
+  }
+
   /// Force contain mode for PiP (no cropping/stretching)
   void enterPipMode() {
+    if (_scalesSubtitlesForPip) unawaited(_enlargeSubtitlesForPip());
     // Disable ambient lighting for PiP — it wastes space on blurred borders
     if (ambientLightingService?.isEnabled == true) {
       _prePipAmbientLighting = true;
@@ -182,6 +220,7 @@ class VideoFilterManager {
 
   /// Restore previous mode when exiting PiP
   void exitPipMode() {
+    if (_scalesSubtitlesForPip) unawaited(_restoreSubtitlesAfterPip());
     var shouldUpdate = false;
     if (_prePipBoxFitMode != null) {
       _boxFitMode = _prePipBoxFitMode!;

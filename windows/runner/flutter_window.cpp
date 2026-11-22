@@ -239,6 +239,19 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message, WPARAM const wparam
       // drags an edge. Returning TRUE means the adjusted rect is authoritative.
       if (ApplyPipAspect(wparam, reinterpret_cast<RECT*>(lparam))) return TRUE;
       break;
+    case WM_NCCALCSIZE:
+      // The PiP tile keeps WS_THICKFRAME so Windows still runs its sizing loop
+      // (and WM_SIZING still holds the aspect ratio), but with no caption that
+      // frame paints as a grey strip across the top of the video. Claiming the
+      // whole window rect as client area removes it.
+      //
+      // The edges stop being grabbable as a result — the Flutter view is a
+      // child window covering the entire client area, so the cursor never
+      // reaches this window's own frame and WM_NCHITTEST here would never see
+      // it. PipWindowOverlay draws the grab zones instead and calls
+      // window_manager's startResizing, which re-enters the same sizing loop.
+      if (is_pip_ && wparam == TRUE) return 0;
+      break;
     case WM_WINDOWPOSCHANGED:
       // Don't persist placement while fullscreen, mid-toggle, or hidden — the
       // rect would overwrite the user's real window position or show state.
@@ -536,9 +549,20 @@ void FlutterWindow::SetNativePip(bool pip, double aspect) {
       return;
     }
 
+    // placement_before_pip_ is what OnDestroy persists; rect/maximize are what
+    // the exit path below restores.
     QueryWindowPlacement(hwnd, &placement_before_pip_);
+    ::GetWindowRect(hwnd, &rect_before_pip_);
+    was_maximized_before_pip_ = ::IsZoomed(hwnd) != FALSE;
     style_before_pip_ = ::GetWindowLongPtr(hwnd, GWL_STYLE);
     ex_style_before_pip_ = ::GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+
+    // Drop out of the maximized state before sizing. A maximized window that
+    // is merely moved and sized stays *logically* maximized, and then nothing
+    // on the way out can restore it: SetWindowPlacement(SW_SHOWMAXIMIZED) and
+    // ShowWindow(SW_SHOWMAXIMIZED) are both no-ops for a window Windows
+    // already considers maximized, so the PiP rect would simply stay.
+    if (was_maximized_before_pip_) ::ShowWindow(hwnd, SW_RESTORE);
 
     // Keep WS_THICKFRAME so the tile stays resizable from its edges; drop the
     // caption and its buttons, which is what makes it read as PiP. WS_CAPTION
@@ -572,31 +596,49 @@ void FlutterWindow::SetNativePip(bool pip, double aspect) {
     const LONG width = target.right - target.left;
     const LONG height = target.bottom - target.top;
 
+    // Set before the move: SWP_FRAMECHANGED is what makes Windows ask for the
+    // frame again (WM_NCCALCSIZE), and that handler keys off is_pip_.
+    is_pip_ = true;
+
     const LONG margin = scaled(24);
     ::SetWindowPos(
         hwnd, HWND_TOPMOST, mi.rcWork.right - width - margin, mi.rcWork.bottom - height - margin, width, height,
         SWP_FRAMECHANGED | SWP_NOACTIVATE);
-
-    is_pip_ = true;
   } else {
+    // Clear first, so the frame recalculation below rebuilds a real frame.
+    is_pip_ = false;
+
     if (style_before_pip_ != 0) {
-      ::SetWindowLongPtr(hwnd, GWL_STYLE, style_before_pip_);
+      // Mask out the maximize/minimize *state* bits. They were captured while
+      // the window was maximized, and putting WS_MAXIMIZE back on a window
+      // that is currently small makes Windows believe it is already maximized
+      // — ShowWindow(SW_SHOWMAXIMIZED) then does nothing and the tile-sized
+      // window stays. The state is restored below instead.
+      ::SetWindowLongPtr(hwnd, GWL_STYLE, style_before_pip_ & ~(WS_MAXIMIZE | WS_MINIMIZE));
       ::SetWindowLongPtr(hwnd, GWL_EXSTYLE, ex_style_before_pip_);
     }
 
-    // Drop topmost before restoring the placement, or the window flashes above
-    // everything else at its old size for a frame.
+    // Drop topmost before resizing, or the window flashes above everything
+    // else at its PiP size for a frame.
     ::SetWindowPos(
         hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
 
-    if (placement_before_pip_.length == sizeof(WINDOWPLACEMENT)) {
-      WINDOWPLACEMENT wp = placement_before_pip_;
-      if (wp.showCmd == SW_SHOWMINIMIZED) wp.showCmd = SW_SHOWNORMAL;
-      ::SetWindowPlacement(hwnd, &wp);
+    // Restore the rect directly instead of through SetWindowPlacement: the
+    // saved placement is in registry shape (see rect_before_pip_), and a plain
+    // SetWindowPos is unambiguous for a window that is on screen right now.
+    if (was_maximized_before_pip_) {
+      ::ShowWindow(hwnd, SW_SHOWMAXIMIZED);
+    } else if (rect_before_pip_.right > rect_before_pip_.left &&
+               rect_before_pip_.bottom > rect_before_pip_.top) {
+      ::SetWindowPos(
+          hwnd, nullptr, rect_before_pip_.left, rect_before_pip_.top,
+          rect_before_pip_.right - rect_before_pip_.left, rect_before_pip_.bottom - rect_before_pip_.top,
+          SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     }
 
-    is_pip_ = false;
     placement_before_pip_ = {};
+    rect_before_pip_ = {};
+    was_maximized_before_pip_ = false;
     style_before_pip_ = 0;
     ex_style_before_pip_ = 0;
   }
