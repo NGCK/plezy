@@ -1,5 +1,7 @@
 #include "flutter_window.h"
 
+#include <algorithm>
+#include <cmath>
 #include <optional>
 
 #include "flutter/generated_plugin_registrant.h"
@@ -165,6 +167,7 @@ bool FlutterWindow::OnCreate() {
       flutter_controller_->engine()->GetRegistrarForPlugin("MpvAudioPlayerPlugin"));
 
   RegisterWindowChannel();
+  RegisterPipChannel();
 
   SetChildContent(flutter_controller_->view()->GetNativeWindow());
 
@@ -193,11 +196,16 @@ void FlutterWindow::OnDestroy() {
   // rather than the fullscreen rect so the next launch restores correctly.
   if (is_fullscreen_ && placement_before_fullscreen_.length != 0) {
     WriteWindowPlacement(placement_before_fullscreen_);
+  } else if (is_pip_ && placement_before_pip_.length != 0) {
+    // Same reasoning for PiP: quitting from the small corner tile must not
+    // make the next launch open as a tiny borderless window.
+    WriteWindowPlacement(placement_before_pip_);
   } else {
     SaveWindowPlacement(GetHandle());
   }
 
   window_channel_ = nullptr;
+  pip_channel_ = nullptr;
 
   if (flutter_controller_) {
     flutter_controller_ = nullptr;
@@ -225,6 +233,11 @@ FlutterWindow::MessageHandler(HWND hwnd, UINT const message, WPARAM const wparam
       if (flutter_controller_) {
         flutter_controller_->engine()->ReloadSystemFonts();
       }
+      break;
+    case WM_SIZING:
+      // While in PiP, hold the window to the video's aspect ratio as the user
+      // drags an edge. Returning TRUE means the adjusted rect is authoritative.
+      if (ApplyPipAspect(wparam, reinterpret_cast<RECT*>(lparam))) return TRUE;
       break;
     case WM_WINDOWPOSCHANGED:
       // Don't persist placement while fullscreen, mid-toggle, or hidden — the
@@ -366,4 +379,228 @@ void FlutterWindow::SetNativeFullScreen(bool fullscreen) {
 
   g_suppressPlacementSave = false;
   NotifyFullScreenChanged();
+}
+
+// ---------------------------------------------------------------------------
+// Desktop picture-in-picture (com.plezy/pip method channel)
+//
+// Windows has no OS-level PiP for a Win32 window (CompactOverlay is UWP only),
+// so this builds it from the same pieces as native fullscreen: save the
+// placement and styles, strip the caption, move to a small rect, restore on
+// exit. Differences from fullscreen: WS_THICKFRAME stays so the tile can be
+// resized, the window goes topmost, the rect is a corner of the *work* area
+// (clear of the taskbar), and WM_SIZING holds the video's aspect ratio.
+//
+// The channel name matches what lib/services/pip_service.dart already uses for
+// Android, iOS and macOS, so the existing player button, PiP video filters and
+// isPipActive listeners all drive this unchanged.
+// ---------------------------------------------------------------------------
+void FlutterWindow::RegisterPipChannel() {
+  auto messenger = flutter_controller_->engine()->messenger();
+  pip_channel_ = std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
+      messenger, "com.plezy/pip", &flutter::StandardMethodCodec::GetInstance());
+
+  pip_channel_->SetMethodCallHandler([this](
+                                         const flutter::MethodCall<flutter::EncodableValue>& call,
+                                         std::unique_ptr<flutter::MethodResult<flutter::EncodableValue>> result) {
+    const std::string& name = call.method_name();
+    if (name == "isSupported") {
+      result->Success(flutter::EncodableValue(true));
+    } else if (name == "enter") {
+      // Dart sends the video's pixel dimensions; a missing or degenerate pair
+      // leaves the previous (or default 16:9) ratio in place.
+      double aspect = 0.0;
+      if (const auto* args = std::get_if<flutter::EncodableMap>(call.arguments())) {
+        auto number = [args](const char* key) -> double {
+          auto it = args->find(flutter::EncodableValue(key));
+          if (it == args->end()) return 0.0;
+          if (const int32_t* i = std::get_if<int32_t>(&it->second)) return static_cast<double>(*i);
+          if (const int64_t* l = std::get_if<int64_t>(&it->second)) return static_cast<double>(*l);
+          if (const double* d = std::get_if<double>(&it->second)) return *d;
+          return 0.0;
+        };
+        const double width = number("width");
+        const double height = number("height");
+        if (width > 0.0 && height > 0.0) aspect = width / height;
+      }
+      SetNativePip(true, aspect);
+      flutter::EncodableMap response{{flutter::EncodableValue("success"), flutter::EncodableValue(is_pip_)}};
+      if (!is_pip_) {
+        response[flutter::EncodableValue("errorCode")] = flutter::EncodableValue("failed");
+      }
+      result->Success(flutter::EncodableValue(response));
+    } else if (name == "exit") {
+      SetNativePip(false, 0.0);
+      result->Success();
+    } else if (name == "setAutoPipReady") {
+      // No OS-driven auto-PiP on Windows (nothing enters PiP on minimize), so
+      // there is nothing to arm — but answer, or the Dart call throws.
+      result->Success();
+    } else {
+      result->NotImplemented();
+    }
+  });
+}
+
+void FlutterWindow::NotifyPipChanged() {
+  if (!pip_channel_) return;
+  pip_channel_->InvokeMethod("onPipChanged", std::make_unique<flutter::EncodableValue>(is_pip_));
+}
+
+bool FlutterWindow::ApplyPipAspect(WPARAM edge, RECT* rect) {
+  if (!is_pip_ || pip_aspect_ <= 0.0 || rect == nullptr) return false;
+  HWND hwnd = GetHandle();
+  if (!hwnd) return false;
+
+  // Measure the frame from the live window rather than AdjustWindowRectEx:
+  // exact at any DPI, and the padding is constant through a resize drag.
+  RECT window_rect{};
+  RECT client_rect{};
+  if (!::GetWindowRect(hwnd, &window_rect) || !::GetClientRect(hwnd, &client_rect)) return false;
+  const LONG pad_w = (window_rect.right - window_rect.left) - (client_rect.right - client_rect.left);
+  const LONG pad_h = (window_rect.bottom - window_rect.top) - (client_rect.bottom - client_rect.top);
+
+  const LONG client_w = (rect->right - rect->left) - pad_w;
+  const LONG client_h = (rect->bottom - rect->top) - pad_h;
+  if (client_w <= 0 || client_h <= 0) return false;
+
+  switch (edge) {
+    case WMSZ_LEFT:
+    case WMSZ_RIGHT:
+      // Horizontal drag drives the height.
+      rect->bottom = rect->top + static_cast<LONG>(std::llround(client_w / pip_aspect_)) + pad_h;
+      return true;
+    case WMSZ_TOP:
+    case WMSZ_BOTTOM:
+      // Vertical drag drives the width.
+      rect->right = rect->left + static_cast<LONG>(std::llround(client_h * pip_aspect_)) + pad_w;
+      return true;
+    case WMSZ_TOPLEFT:
+    case WMSZ_TOPRIGHT:
+      // Corner drags follow the width and grow away from the anchored edge.
+      rect->top = rect->bottom - static_cast<LONG>(std::llround(client_w / pip_aspect_)) - pad_h;
+      return true;
+    case WMSZ_BOTTOMLEFT:
+    case WMSZ_BOTTOMRIGHT:
+      rect->bottom = rect->top + static_cast<LONG>(std::llround(client_w / pip_aspect_)) + pad_h;
+      return true;
+    default:
+      return false;
+  }
+}
+
+void FlutterWindow::SetNativePip(bool pip, double aspect) {
+  HWND hwnd = GetHandle();
+  if (!hwnd) return;
+
+  if (aspect > 0.0) pip_aspect_ = aspect;
+
+  if (pip == is_pip_) {
+    // Already in PiP and the video changed shape (next episode, a different
+    // file): reshape around the current top-left instead of re-parking.
+    if (pip && aspect > 0.0) {
+      RECT window_rect{};
+      RECT client_rect{};
+      if (::GetWindowRect(hwnd, &window_rect) && ::GetClientRect(hwnd, &client_rect)) {
+        const LONG pad_h = (window_rect.bottom - window_rect.top) - (client_rect.bottom - client_rect.top);
+        const LONG width = window_rect.right - window_rect.left;
+        const LONG client_w = client_rect.right - client_rect.left;
+        const LONG height = static_cast<LONG>(std::llround(client_w / pip_aspect_)) + pad_h;
+        ::SetWindowPos(hwnd, nullptr, 0, 0, width, height, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+      }
+    }
+    return;
+  }
+
+  // Fullscreen and PiP are mutually exclusive. Leaving fullscreen first also
+  // puts the window back on its pre-fullscreen placement, which is the one
+  // PiP should save and return to.
+  if (pip && is_fullscreen_) SetNativeFullScreen(false);
+
+  g_suppressPlacementSave = true;
+  if (g_saveTimerId) {
+    KillTimer(nullptr, g_saveTimerId);
+    g_saveTimerId = 0;
+  }
+
+  if (pip) {
+    // Resolve the target monitor before mutating saved state, so a failure
+    // leaves nothing stale for a later exit call to act on.
+    RECT wr{};
+    ::GetWindowRect(hwnd, &wr);
+    POINT center{(wr.left + wr.right) / 2, (wr.top + wr.bottom) / 2};
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    if (!::GetMonitorInfoW(::MonitorFromPoint(center, MONITOR_DEFAULTTONEAREST), &mi)) {
+      g_suppressPlacementSave = false;
+      return;
+    }
+
+    QueryWindowPlacement(hwnd, &placement_before_pip_);
+    style_before_pip_ = ::GetWindowLongPtr(hwnd, GWL_STYLE);
+    ex_style_before_pip_ = ::GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+
+    // Keep WS_THICKFRAME so the tile stays resizable from its edges; drop the
+    // caption and its buttons, which is what makes it read as PiP. WS_CAPTION
+    // carries WS_BORDER, so this removes the title bar entirely.
+    const LONG_PTR style =
+        (style_before_pip_ & ~(WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX)) | WS_THICKFRAME;
+    const LONG_PTR ex_style =
+        ex_style_before_pip_ & ~(WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE);
+    ::SetWindowLongPtr(hwnd, GWL_STYLE, style);
+    ::SetWindowLongPtr(hwnd, GWL_EXSTYLE, ex_style);
+
+    // A quarter of the work area's width, clamped to something watchable, and
+    // never taller than half the screen for very tall aspect ratios.
+    const LONG work_w = mi.rcWork.right - mi.rcWork.left;
+    const LONG work_h = mi.rcWork.bottom - mi.rcWork.top;
+    const UINT dpi = ::GetDpiForWindow(hwnd);
+    const double scale = dpi > 0 ? dpi / 96.0 : 1.0;
+    const auto scaled = [scale](double logical) { return static_cast<LONG>(std::llround(logical * scale)); };
+
+    LONG client_w = std::clamp<LONG>(work_w / 4, scaled(320), scaled(854));
+    LONG client_h = static_cast<LONG>(std::llround(client_w / pip_aspect_));
+    if (client_h > work_h / 2) {
+      client_h = work_h / 2;
+      client_w = static_cast<LONG>(std::llround(client_h * pip_aspect_));
+    }
+
+    // Size the client area, not the window: the thick frame would otherwise
+    // eat into the video and break the ratio before the first resize.
+    RECT target{0, 0, client_w, client_h};
+    ::AdjustWindowRectEx(&target, static_cast<DWORD>(style), FALSE, static_cast<DWORD>(ex_style));
+    const LONG width = target.right - target.left;
+    const LONG height = target.bottom - target.top;
+
+    const LONG margin = scaled(24);
+    ::SetWindowPos(
+        hwnd, HWND_TOPMOST, mi.rcWork.right - width - margin, mi.rcWork.bottom - height - margin, width, height,
+        SWP_FRAMECHANGED | SWP_NOACTIVATE);
+
+    is_pip_ = true;
+  } else {
+    if (style_before_pip_ != 0) {
+      ::SetWindowLongPtr(hwnd, GWL_STYLE, style_before_pip_);
+      ::SetWindowLongPtr(hwnd, GWL_EXSTYLE, ex_style_before_pip_);
+    }
+
+    // Drop topmost before restoring the placement, or the window flashes above
+    // everything else at its old size for a frame.
+    ::SetWindowPos(
+        hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+
+    if (placement_before_pip_.length == sizeof(WINDOWPLACEMENT)) {
+      WINDOWPLACEMENT wp = placement_before_pip_;
+      if (wp.showCmd == SW_SHOWMINIMIZED) wp.showCmd = SW_SHOWNORMAL;
+      ::SetWindowPlacement(hwnd, &wp);
+    }
+
+    is_pip_ = false;
+    placement_before_pip_ = {};
+    style_before_pip_ = 0;
+    ex_style_before_pip_ = 0;
+  }
+
+  g_suppressPlacementSave = false;
+  NotifyPipChanged();
 }

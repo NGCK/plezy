@@ -78,6 +78,7 @@ import 'helpers/two_finger_tap_tracker.dart';
 import 'widgets/linux_keep_alive.dart';
 import 'widgets/mobile_edge_adjustment_indicator.dart';
 import 'widgets/mobile_skip_zones.dart';
+import 'widgets/pip_window_overlay.dart';
 import 'widgets/skip_marker_button.dart';
 import 'widgets/screen_lock_overlay.dart';
 import 'widgets/track_chapter_controls.dart';
@@ -1213,6 +1214,9 @@ class _PlexVideoControlsState extends State<PlexVideoControls>
     return ValueListenableBuilder<bool>(
       valueListenable: _pipService.isPipActive,
       builder: (context, isInPip, _) {
+        // Windows PiP reshapes this same window into a captionless tile, so
+        // something has to stay on screen to move it and to leave PiP.
+        if (isInPip && Platform.isWindows) return const PipWindowOverlay();
         if (isInPip && !Platform.isMacOS) return const SizedBox.shrink();
         return Focus(
           focusNode: _focusNode,

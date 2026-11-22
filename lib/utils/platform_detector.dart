@@ -342,7 +342,9 @@ class PlatformDetector {
   }
 
   static bool supportsPictureInPicture() => pictureInPictureAllowed(
-    hostSupportsPictureInPicture: Platform.isAndroid || Platform.isIOS || Platform.isMacOS,
+    // Windows has no OS-level PiP for a Win32 window; the Win32 runner builds
+    // the equivalent by reshaping the app window (see PipService).
+    hostSupportsPictureInPicture: Platform.isAndroid || Platform.isIOS || Platform.isMacOS || Platform.isWindows,
     isAppleTv: isAppleTV(),
     isTv: isTV(),
     isAutomotive: isAutomotive(),

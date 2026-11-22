@@ -7,8 +7,13 @@ import 'package:plezy/i18n/strings.g.dart';
 class PipService {
   static const MethodChannel _channel = MethodChannel('com.plezy/pip');
 
-  /// PiP is only implemented natively on Android, iOS, and macOS.
-  static bool get _isAvailable => Platform.isAndroid || Platform.isIOS || Platform.isMacOS;
+  /// PiP is implemented natively on Android, iOS and macOS, and on Windows by
+  /// the Win32 runner (windows/runner/flutter_window.cpp), which reshapes the
+  /// app window into a borderless, always-on-top, aspect-locked tile. The
+  /// runner answers the same method names, so everything downstream of this
+  /// service — the player button, the PiP video filters, isPipActive — needs
+  /// no per-platform branching.
+  static bool get _isAvailable => Platform.isAndroid || Platform.isIOS || Platform.isMacOS || Platform.isWindows;
 
   static final PipService _instance = PipService._internal();
   factory PipService() => _instance;
